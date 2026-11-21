@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meu Agente IA</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; background: #0f172a; color: #f8fafc; }
+    #chat { border: 1px solid #334155; border-radius: 8px; padding: 1rem; height: 420px; overflow-y: auto; margin-bottom: 1rem; background: #1e293b; }
+    .msg { margin-bottom: 0.8rem; line-height: 1.5; white-space: pre-wrap; }
+    .user { color: #38bdf8; }
+    .bot { color: #e2e8f0; }
+    form { display: flex; gap: 0.5rem; }
+    input { flex: 1; padding: 0.75rem; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: white; }
+    button { padding: 0.75rem 1.2rem; border-radius: 6px; border: none; background: #2563eb; color: white; cursor: pointer; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h2>Agente IA (100% Gratuito)</h2>
+  <div id="chat"></div>
+  <form id="form">
+    <input id="input" placeholder="Digite sua tarefa ou pergunta..." required />
+    <button type="submit">Enviar</button>
+  </form>
+
+  <script>
+    const chat = document.getElementById("chat");
+    const form = document.getElementById("form");
+    const input = document.getElementById("input");
+    const history = [];
+
+    function addMsg(sender, text, cls) {
+      const div = document.createElement("div");
+      div.className = `msg ${cls}`;
+      div.textContent = `${sender}: ${text}`;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMsg("Você", text, "user");
+      input.value = "";
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, history })
+      });
+
+      const data = await res.json();
+      const reply = data.reply || "Erro ao consultar o agente.";
+      addMsg("Agente", reply, "bot");
+
+      history.push({ role: "user", content: text }, { role: "assistant", content: reply });
+    });
+  </script>
+</body>
+</html>
