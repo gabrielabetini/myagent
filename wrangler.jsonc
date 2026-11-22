@@ -4,5 +4,11 @@
   "compatibility_date": "2026-11-21",
   "assets": {
     "directory": "./public"
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "MEMORY",
+      "id": "1555c2f00dc144c28660e40795c4467f"
+    }
+  ]
 }
