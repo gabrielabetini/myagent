@@ -97,16 +97,21 @@ async function processUserMessage({ userId, userText, fallbackHistory, env }) {
       ? `\n\nNOTAS/LEMBRETES SALVOS DO USUÁRIO:\n${savedNotes.map((n, i) => `${i + 1}. ${n}`).join("\n")}`
       : "\n\nNOTAS/LEMBRETES SALVOS DO USUÁRIO: Nenhuma nota salva ainda.";
 
+  const nowIso = new Date().toISOString();
+
   const systemPrompt = {
     role: "system",
     content:
       "Você é um agente autônomo pessoal prestativo, objetivo e direto. Responda sempre em português.\n" +
-      "Você possui ferramentas externas gratuitas. Quando precisar de dados reais ou salvar algo, responda APENAS com um dos comandos abaixo (sem texto extra):\n" +
+      `Data e hora atual de referência (UTC): ${nowIso}. Fuso horário padrão do usuário: Europe/Madrid (+01:00 no inverno).\n` +
+      "Você possui ferramentas externas gratuitas. Quando precisar de dados reais, mexer na agenda ou salvar algo, responda APENAS com um dos comandos abaixo (sem texto extra):\n" +
       "1. [[WEATHER: Nome da Cidade]] -> para consultar clima e previsão do tempo.\n" +
       "2. [[CURRENCY: VALOR MOEDA_ORIGEM MOEDA_DESTINO]] -> para câmbio (ex: [[CURRENCY: 100 EUR BRL]] ou [[CURRENCY: 1 USD BRL]]).\n" +
       "3. [[WIKI: Termo de busca]] -> para consultar fatos, história, ciência ou conceitos na Wikipedia.\n" +
       "4. [[SAVE_NOTE: texto da nota]] -> quando o usuário pedir para anotar, lembrar ou guardar uma informação/tarefa.\n" +
       "5. [[DELETE_NOTE: número]] -> quando o usuário pedir para apagar uma nota pelo número.\n" +
+      "6. [[CALENDAR_LIST]] -> para listar os próximos eventos do Google Agenda.\n" +
+      "7. [[CALENDAR_ADD: Título | YYYY-MM-DDTHH:mm:ss+01:00 | YYYY-MM-DDTHH:mm:ss+01:00]] -> para criar um evento no Google Agenda (início e fim em ISO 8601).\n" +
       "Se não precisar de nenhuma ferramenta, responda diretamente ao usuário usando seu conhecimento e as notas salvas abaixo." +
       notesContext
   };
@@ -127,6 +132,8 @@ async function processUserMessage({ userId, userText, fallbackHistory, env }) {
   const wikiMatch = reply.match(/\[\[WIKI:\s*(.+?)\]\]/i);
   const saveNoteMatch = reply.match(/\[\[SAVE_NOTE:\s*(.+?)\]\]/i);
   const deleteNoteMatch = reply.match(/\[\[DELETE_NOTE:\s*(\d+)\]\]/i);
+  const calendarListMatch = reply.match(/\[\[CALENDAR_LIST\]\]/i);
+  const calendarAddMatch = reply.match(/\[\[CALENDAR_ADD:\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\]\]/i);
 
   if (weatherMatch) {
     toolResult = await getWeatherFromOpenMeteo(weatherMatch[1].trim());
@@ -152,6 +159,14 @@ async function processUserMessage({ userId, userText, fallbackHistory, env }) {
     } else {
       toolResult = `Número de nota inválido. O usuário tem ${savedNotes.length} nota(s).`;
     }
+  } else if (calendarListMatch) {
+    toolResult = await listCalendarEvents(env);
+  } else if (calendarAddMatch) {
+    toolResult = await createCalendarEvent(env, {
+      summary: calendarAddMatch[1].trim(),
+      startIso: calendarAddMatch[2].trim(),
+      endIso: calendarAddMatch[3].trim()
+    });
   }
 
   // Se uma ferramenta foi usada, faz segunda chamada para formular a resposta final
@@ -265,6 +280,132 @@ async function searchWikipedia(query) {
   const summaryData = await summaryRes.json();
 
   return `Artigo: ${summaryData.title}\nResumo: ${summaryData.extract || "Sem resumo disponível."}`;
+}
+
+// Ferramenta 4: Google Calendar (Service Account via Web Crypto API nativa)
+async function getGoogleAccessToken(clientEmail, privateKeyPem) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/calendar",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  };
+
+  const encodeBase64Url = (objOrStr) => {
+    const bytes = typeof objOrStr === "string"
+      ? new TextEncoder().encode(objOrStr)
+      : new TextEncoder().encode(JSON.stringify(objOrStr));
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  };
+
+  const unsignedToken = `${encodeBase64Url(header)}.${encodeBase64Url(payload)}`;
+
+  const cleanPem = privateKeyPem
+    .replace(/\\n/g, "\n")
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s+/g, "");
+
+  const binaryDer = Uint8Array.from(atob(cleanPem), (c) => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryDer.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const sigBytes = new Uint8Array(signature);
+  let sigBinary = "";
+  for (let i = 0; i < sigBytes.length; i++) {
+    sigBinary += String.fromCharCode(sigBytes[i]);
+  }
+  const signedJwt = `${unsignedToken}.${btoa(sigBinary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: signedJwt
+    })
+  });
+
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(`Erro ao autenticar no Google: ${JSON.stringify(tokenData)}`);
+  }
+
+  return tokenData.access_token;
+}
+
+async function listCalendarEvents(env, maxResults = 10) {
+  const token = await getGoogleAccessToken(env.GOOGLE_CLIENT_EMAIL, env.GOOGLE_PRIVATE_KEY);
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID || "primary");
+  const timeMin = encodeURIComponent(new Date().toISOString());
+
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?timeMin=${timeMin}&maxResults=${maxResults}&singleEvents=true&orderBy=startTime`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Erro ao ler agenda: ${JSON.stringify(data)}`);
+  }
+
+  const items = data.items || [];
+  if (items.length === 0) {
+    return "Nenhum evento futuro encontrado na agenda.";
+  }
+
+  return items
+    .map((ev) => {
+      const start = ev.start?.dateTime || ev.start?.date || "Sem data";
+      return `- ${ev.summary || "(Sem título)"} | Início: ${start}`;
+    })
+    .join("\n");
+}
+
+async function createCalendarEvent(env, { summary, startIso, endIso, description = "" }) {
+  const token = await getGoogleAccessToken(env.GOOGLE_CLIENT_EMAIL, env.GOOGLE_PRIVATE_KEY);
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID || "primary");
+
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      summary,
+      description,
+      start: { dateTime: startIso },
+      end: { dateTime: endIso }
+    })
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Erro ao criar evento: ${JSON.stringify(data)}`);
+  }
+
+  return `Evento criado com sucesso: "${data.summary}" em ${data.start?.dateTime || startIso}.`;
 }
 
 async function askGroq(messages, apiKey) {
