@@ -6,22 +6,13 @@ export default {
     if (request.method === "POST" && url.pathname === "/api/chat") {
       try {
         const { message, history = [] } = await request.json();
+        const reply = await processUserMessage({
+          userId: "web-user",
+          userText: message,
+          fallbackHistory: history,
+          env
+        });
 
-        const systemPrompt = {
-          role: "system",
-          content:
-            "Você é um agente autônomo prestativo, objetivo e direto. Responda em português. " +
-            "Quando o usuário perguntar sobre clima ou previsão do tempo de algum lugar, NÃO invente dados: " +
-            "responda APENAS com [[WEATHER: Nome da Cidade]] para o sistema consultar a previsão real."
-        };
-
-        const messages = [
-          systemPrompt,
-          ...history.slice(-10),
-          { role: "user", content: message }
-        ];
-
-        const reply = await runAgentWithWeather(messages, env.LLM_API_KEY);
         return new Response(JSON.stringify({ reply }), {
           headers: { "Content-Type": "application/json" }
         });
@@ -50,25 +41,14 @@ export default {
           return new Response("Forbidden", { status: 403 });
         }
 
-        const systemPrompt = {
-          role: "system",
-          content:
-            "Você é um agente autônomo prestativo, objetivo e direto no Telegram. Responda em português. " +
-            "Quando o usuário perguntar sobre clima ou previsão do tempo de algum lugar, NÃO invente dados: " +
-            "responda APENAS com [[WEATHER: Nome da Cidade]] para o sistema consultar a previsão real."
-        };
+        const reply = await processUserMessage({
+          userId: `tg-${senderId}`,
+          userText: msg.text,
+          fallbackHistory: [],
+          env
+        });
 
-        const reply = await runAgentWithWeather(
-          [systemPrompt, { role: "user", content: msg.text }],
-          env.LLM_API_KEY
-        );
-
-        await sendTelegramMessage(
-          env.TELEGRAM_BOT_TOKEN,
-          msg.chat.id,
-          reply
-        );
-
+        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, msg.chat.id, reply);
         return new Response("OK", { status: 200 });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), {
@@ -82,39 +62,132 @@ export default {
   }
 };
 
-// Decide se precisa buscar clima antes de responder
-async function runAgentWithWeather(messages, apiKey) {
-  const firstReply = await askGroq(messages, apiKey);
-
-  // Verifica se a IA pediu os dados do tempo
-  const match = firstReply.match(/\[\[WEATHER:\s*(.+?)\]\]/i);
-  if (!match) {
-    return firstReply;
+// Núcleo do Agente: carrega memória, decide ferramentas e salva histórico
+async function processUserMessage({ userId, userText, fallbackHistory, env }) {
+  // Comando rápido para limpar histórico de conversa se quiser
+  if (userText.trim().toLowerCase() === "/limpar") {
+    if (env.MEMORY) {
+      await env.MEMORY.delete(`chat:${userId}`);
+    }
+    return "Memória recente da conversa apagada! (Suas notas salvas continuam intactas).";
   }
 
-  const city = match[1].trim();
-  const weatherData = await getWeatherFromOpenMeteo(city);
+  // 1. Carrega histórico persistente e notas salvas do Cloudflare KV
+  let savedHistory = fallbackHistory;
+  let savedNotes = [];
 
-  const followUpMessages = [
-    ...messages,
-    { role: "assistant", content: firstReply },
-    {
-      role: "user",
-      content: `Dados reais do tempo para "${city}":\n${weatherData}\n\nAgora responda ao usuário em português de forma clara e objetiva usando esses dados.`
+  if (env.MEMORY) {
+    const rawHistory = await env.MEMORY.get(`chat:${userId}`);
+    if (rawHistory) {
+      try {
+        savedHistory = JSON.parse(rawHistory);
+      } catch (_) {}
     }
+
+    const rawNotes = await env.MEMORY.get(`notes:${userId}`);
+    if (rawNotes) {
+      try {
+        savedNotes = JSON.parse(rawNotes);
+      } catch (_) {}
+    }
+  }
+
+  const notesContext =
+    savedNotes.length > 0
+      ? `\n\nNOTAS/LEMBRETES SALVOS DO USUÁRIO:\n${savedNotes.map((n, i) => `${i + 1}. ${n}`).join("\n")}`
+      : "\n\nNOTAS/LEMBRETES SALVOS DO USUÁRIO: Nenhuma nota salva ainda.";
+
+  const systemPrompt = {
+    role: "system",
+    content:
+      "Você é um agente autônomo pessoal prestativo, objetivo e direto. Responda sempre em português.\n" +
+      "Você possui ferramentas externas gratuitas. Quando precisar de dados reais ou salvar algo, responda APENAS com um dos comandos abaixo (sem texto extra):\n" +
+      "1. [[WEATHER: Nome da Cidade]] -> para consultar clima e previsão do tempo.\n" +
+      "2. [[CURRENCY: VALOR MOEDA_ORIGEM MOEDA_DESTINO]] -> para câmbio (ex: [[CURRENCY: 100 EUR BRL]] ou [[CURRENCY: 1 USD BRL]]).\n" +
+      "3. [[WIKI: Termo de busca]] -> para consultar fatos, história, ciência ou conceitos na Wikipedia.\n" +
+      "4. [[SAVE_NOTE: texto da nota]] -> quando o usuário pedir para anotar, lembrar ou guardar uma informação/tarefa.\n" +
+      "5. [[DELETE_NOTE: número]] -> quando o usuário pedir para apagar uma nota pelo número.\n" +
+      "Se não precisar de nenhuma ferramenta, responda diretamente ao usuário usando seu conhecimento e as notas salvas abaixo." +
+      notesContext
+  };
+
+  const messages = [
+    systemPrompt,
+    ...savedHistory.slice(-12),
+    { role: "user", content: userText }
   ];
 
-  return await askGroq(followUpMessages, apiKey);
+  // Primeira chamada ao modelo
+  let reply = await askGroq(messages, env.LLM_API_KEY);
+  let toolResult = null;
+
+  // Verifica se o agente acionou alguma ferramenta
+  const weatherMatch = reply.match(/\[\[WEATHER:\s*(.+?)\]\]/i);
+  const currencyMatch = reply.match(/\[\[CURRENCY:\s*([0-9.,]+)\s+([A-Za-z]{3})\s+([A-Za-z]{3})\]\]/i);
+  const wikiMatch = reply.match(/\[\[WIKI:\s*(.+?)\]\]/i);
+  const saveNoteMatch = reply.match(/\[\[SAVE_NOTE:\s*(.+?)\]\]/i);
+  const deleteNoteMatch = reply.match(/\[\[DELETE_NOTE:\s*(\d+)\]\]/i);
+
+  if (weatherMatch) {
+    toolResult = await getWeatherFromOpenMeteo(weatherMatch[1].trim());
+  } else if (currencyMatch) {
+    toolResult = await getCurrencyRate(currencyMatch[1], currencyMatch[2], currencyMatch[3]);
+  } else if (wikiMatch) {
+    toolResult = await searchWikipedia(wikiMatch[1].trim());
+  } else if (saveNoteMatch) {
+    const newNote = saveNoteMatch[1].trim();
+    savedNotes.push(newNote);
+    if (env.MEMORY) {
+      await env.MEMORY.put(`notes:${userId}`, JSON.stringify(savedNotes));
+    }
+    toolResult = `Nota salva com sucesso na memória permanente: "${newNote}". Total de notas agora: ${savedNotes.length}.`;
+  } else if (deleteNoteMatch) {
+    const idx = parseInt(deleteNoteMatch[1], 10) - 1;
+    if (idx >= 0 && idx < savedNotes.length) {
+      const removed = savedNotes.splice(idx, 1)[0];
+      if (env.MEMORY) {
+        await env.MEMORY.put(`notes:${userId}`, JSON.stringify(savedNotes));
+      }
+      toolResult = `Nota removida: "${removed}".`;
+    } else {
+      toolResult = `Número de nota inválido. O usuário tem ${savedNotes.length} nota(s).`;
+    }
+  }
+
+  // Se uma ferramenta foi usada, faz segunda chamada para formular a resposta final
+  if (toolResult) {
+    const followUpMessages = [
+      ...messages,
+      { role: "assistant", content: reply },
+      {
+        role: "user",
+        content: `Resultado da ferramenta:\n${toolResult}\n\nAgora responda ao usuário em português de forma natural, clara e objetiva.`
+      }
+    ];
+    reply = await askGroq(followUpMessages, env.LLM_API_KEY);
+  }
+
+  // Salva o histórico atualizado no Cloudflare KV (mantém as últimas 16 mensagens)
+  if (env.MEMORY) {
+    const updatedHistory = [
+      ...savedHistory.slice(-14),
+      { role: "user", content: userText },
+      { role: "assistant", content: reply }
+    ];
+    await env.MEMORY.put(`chat:${userId}`, JSON.stringify(updatedHistory));
+  }
+
+  return reply;
 }
 
-// Busca cidade + previsão do tempo gratuitamente na Open-Meteo
+// Ferramenta 1: Clima (Open-Meteo - Gratuita, sem chave)
 async function getWeatherFromOpenMeteo(city) {
   const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=pt&format=json`;
   const geoRes = await fetch(geoUrl);
   const geoData = await geoRes.json();
 
   if (!geoRes.ok || !geoData.results || geoData.results.length === 0) {
-    return `Não encontrei a cidade "${city}". Peça ao usuário para confirmar o nome da cidade.`;
+    return `Não encontrei a cidade "${city}".`;
   }
 
   const place = geoData.results[0];
@@ -129,23 +202,69 @@ async function getWeatherFromOpenMeteo(city) {
   const weatherData = await weatherRes.json();
 
   if (!weatherRes.ok || !weatherData.current) {
-    return `Não foi possível obter a previsão do tempo para ${place.name} agora.`;
+    return `Erro ao obter previsão para ${place.name}.`;
   }
 
   const cur = weatherData.current;
   const daily = weatherData.daily;
 
   const nextDays = (daily?.time || [])
-    .map((date, i) => {
-      return `- ${date}: mín ${daily.temperature_2m_min[i]}°C / máx ${daily.temperature_2m_max[i]}°C (chance de chuva: ${daily.precipitation_probability_max[i]}%)`;
-    })
+    .map((date, i) => `- ${date}: mín ${daily.temperature_2m_min[i]}°C / máx ${daily.temperature_2m_max[i]}°C (chuva: ${daily.precipitation_probability_max[i]}%)`)
     .join("\n");
 
   return [
-    `Cidade: ${place.name}, ${place.admin1 || ""} - ${place.country}`,
-    `Agora: ${cur.temperature_2m}°C (sensação de ${cur.apparent_temperature}°C), umidade ${cur.relative_humidity_2m}%, vento ${cur.wind_speed_10m} km/h, chuva agora ${cur.precipitation} mm`,
-    `Previsão para os próximos dias:\n${nextDays}`
+    `Local: ${place.name}, ${place.admin1 || ""} - ${place.country}`,
+    `Agora: ${cur.temperature_2m}°C (sensação ${cur.apparent_temperature}°C), umidade ${cur.relative_humidity_2m}%, vento ${cur.wind_speed_10m} km/h`,
+    `Próximos dias:\n${nextDays}`
   ].join("\n");
+}
+
+// Ferramenta 2: Câmbio (Frankfurter / Banco Central Europeu - Gratuita, sem chave)
+async function getCurrencyRate(rawAmount, fromCurrency, toCurrency) {
+  const amount = parseFloat(String(rawAmount).replace(",", "."));
+  const from = fromCurrency.toUpperCase();
+  const to = toCurrency.toUpperCase();
+
+  if (isNaN(amount) || amount <= 0) {
+    return "Valor numérico inválido para conversão.";
+  }
+
+  const url = `https://api.frankfurter.app/latest?amount=${amount}&from=${from}&to=${to}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    return `Não foi possível converter de ${from} para ${to}. Verifique se os códigos das moedas estão corretos (ex: EUR, BRL, USD).`;
+  }
+
+  const data = await res.json();
+  const converted = data.rates?.[to];
+  if (!converted) {
+    return `Moeda de destino ${to} não encontrada.`;
+  }
+
+  return `${amount} ${from} = ${converted} ${to} (cotação oficial de ${data.date}).`;
+}
+
+// Ferramenta 3: Enciclopédia (Wikipedia REST API - Gratuita, sem chave)
+async function searchWikipedia(query) {
+  const searchUrl = `https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&utf8=1&srlimit=1`;
+  const searchRes = await fetch(searchUrl, {
+    headers: { "User-Agent": "MyAgentCloudflareBot/1.0" }
+  });
+  const searchData = await searchRes.json();
+  const firstHit = searchData?.query?.search?.[0];
+
+  if (!firstHit) {
+    return `Nenhum artigo encontrado na Wikipedia em português para "${query}".`;
+  }
+
+  const title = firstHit.title;
+  const summaryUrl = `https://pt.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+  const summaryRes = await fetch(summaryUrl, {
+    headers: { "User-Agent": "MyAgentCloudflareBot/1.0" }
+  });
+  const summaryData = await summaryRes.json();
+
+  return `Artigo: ${summaryData.title}\nResumo: ${summaryData.extract || "Sem resumo disponível."}`;
 }
 
 async function askGroq(messages, apiKey) {
